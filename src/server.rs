@@ -154,7 +154,7 @@ async fn capabilities(State(state): State<AppState>) -> impl IntoResponse {
     capabilities.digest_algorithms = vec!["blake3".into(), "sha256".into()];
     capabilities.compressors = vec!["identity".into(), "zstd".into()];
     capabilities.action_kinds = BTreeMap::from([
-        ("build-script".into(), ActionKindCapability::new(2, 1)),
+        ("build-script".into(), ActionKindCapability::new(4, 1)),
         ("cc".into(), ActionKindCapability::new(1, 1)),
         ("rustc".into(), ActionKindCapability::new(1, 1)),
         ("task".into(), ActionKindCapability::new(1, 1)),
@@ -978,7 +978,9 @@ fn validate_build_script_action(
     value: serde_json::Value,
     version: u64,
 ) -> Result<ActionKind, ApiError> {
-    if version != 2 {
+    // Schema 3 added `archive_timestamps`; 4 only changed which results mbx
+    // records, so both share the shape below.
+    if !(2..=4).contains(&version) {
         return Err(ApiError::unprocessable(format!(
             "unsupported build-script action schema {version}"
         )));
@@ -1620,6 +1622,21 @@ mod tests {
         }))
     }
 
+    /// A build-script descriptor as mbx 1.24 writes it: schema 4, with the
+    /// archive timestamp policy.
+    fn build_script_action_v4(binary_action: &Digest, archive_timestamps: Option<&str>) -> Vec<u8> {
+        canonical(serde_json::json!({
+            "archive_timestamps":archive_timestamps,
+            "binary_action":binary_action,
+            "cargo_environment":{"TARGET":"x86_64-unknown-linux-gnu"},
+            "environment":{},
+            "inputs":{"${workspace}/build.rs":{"kind":"missing"}},
+            "kind":"build-script",
+            "out_dir":null,
+            "version":4
+        }))
+    }
+
     fn compiler_metadata(kind: &str, stdout: &Digest, stderr: &Digest, version: u8) -> Vec<u8> {
         canonical(serde_json::json!({
             "kind":kind,
@@ -2141,7 +2158,7 @@ mod tests {
                 .unwrap();
         assert_eq!(body["action_kinds"]["task"]["action_schema"], 1);
         assert_eq!(body["action_kinds"]["task"]["metadata_schema"], 1);
-        assert_eq!(body["action_kinds"]["build-script"]["action_schema"], 2);
+        assert_eq!(body["action_kinds"]["build-script"]["action_schema"], 4);
         assert_eq!(body["action_kinds"]["build-script"]["metadata_schema"], 1);
         assert_eq!(body["action_kinds"]["cc"]["action_schema"], 1);
         assert_eq!(body["action_kinds"]["cc"]["metadata_schema"], 1);
@@ -2233,6 +2250,38 @@ mod tests {
             )
             .await,
             StatusCode::CREATED
+        );
+    }
+
+    #[tokio::test]
+    async fn publishes_schema_4_build_script_results() {
+        for archive_timestamps in [None, Some("1")] {
+            let (app, _directory) = test_app().await;
+            let binary_action = digest(b"build script binary action");
+            assert_eq!(
+                publish_compiler_result(
+                    &app,
+                    &build_script_action_v4(&binary_action, archive_timestamps),
+                    "build-script",
+                )
+                .await,
+                StatusCode::CREATED
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_build_script_schemas() {
+        let (app, _directory) = test_app().await;
+        let binary_action = digest(b"build script binary action");
+        assert_eq!(
+            publish_compiler_result(
+                &app,
+                &build_script_action(&binary_action, 5),
+                "build-script",
+            )
+            .await,
+            StatusCode::UNPROCESSABLE_ENTITY
         );
     }
 

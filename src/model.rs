@@ -176,6 +176,9 @@ pub struct CcInput {
 pub struct BuildScriptAction {
     pub version: u8,
     pub kind: String,
+    /// The `ZERO_AR_DATE` policy the script ran under, added in schema 3.
+    #[serde(default)]
+    pub archive_timestamps: Option<String>,
     pub binary_action: Digest,
     pub cargo_environment: BTreeMap<String, Option<String>>,
     pub environment: BTreeMap<String, Option<String>>,
@@ -385,7 +388,9 @@ impl CcInput {
 
 impl BuildScriptAction {
     pub fn validate(&self) -> bool {
-        self.version == 2
+        (2..=4).contains(&self.version)
+            && (self.version >= 3 || self.archive_timestamps.is_none())
+            && self.archive_timestamps.as_deref().is_none_or(valid_string)
             && self.kind == "build-script"
             && self.binary_action.validate().is_ok()
             && valid_optional_string_map(&self.cargo_environment)
