@@ -235,6 +235,8 @@ Treat the output as a secret even though it is short-lived. Set the audience in 
 
 - `docker-compose.yml` runs a local development stack with PostgreSQL and MinIO.
 - `charts/mbx-cache` runs a horizontally scalable Kubernetes deployment.
+- [`deploy/coolify`](deploy/coolify/README.md) runs a single-node, internal-only
+  cache on Coolify for runners on the same Docker host.
 - [`deploy/azure`](deploy/azure/README.md) provisions a low-cost US production
   instance with Terraform and converges its host with `mise bootstrap remote`.
   Cache blobs use Azure Blob Storage in the same region.

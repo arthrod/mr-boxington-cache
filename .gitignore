@@ -8,3 +8,4 @@
 .terraform/
 /deploy/*/bootstrap/cache.env
 /deploy/*/bootstrap/runtime/
+.env
