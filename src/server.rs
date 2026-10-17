@@ -2238,6 +2238,21 @@ mod tests {
         );
     }
 
+    /// mbx names clippy-driver beside rustc in the compiler identity of a
+    /// clippy compilation.
+    #[tokio::test]
+    async fn publishes_rustc_results_compiled_through_a_driver() {
+        let (app, _directory) = test_app().await;
+        let source = digest(b"pub fn widget() {}\n");
+        let mut action: serde_json::Value =
+            serde_json::from_slice(&rustc_action(&source, 1)).unwrap();
+        action["compiler"]["driver"] = "clippy 0.1.97 (test)".into();
+        assert_eq!(
+            publish_compiler_result(&app, &canonical(action), "rustc").await,
+            StatusCode::CREATED
+        );
+    }
+
     #[tokio::test]
     async fn publishes_build_script_results() {
         let (app, _directory) = test_app().await;

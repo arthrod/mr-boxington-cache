@@ -116,6 +116,9 @@ pub struct RustcCompiler {
     pub toolchain: String,
     pub rustc_version: String,
     pub host: String,
+    /// The version of a driver layered over rustc, such as clippy-driver.
+    #[serde(default)]
+    pub driver: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -320,6 +323,7 @@ impl RustcCompiler {
     fn validate(&self) -> bool {
         [&self.toolchain, &self.rustc_version, &self.host]
             .into_iter()
+            .chain(self.driver.as_ref())
             .all(|value| !value.is_empty() && valid_string(value))
     }
 }
