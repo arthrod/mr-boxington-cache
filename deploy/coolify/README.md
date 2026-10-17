@@ -23,7 +23,7 @@ reach it over a shared Docker network.
 
    Re-running it keeps the secrets already in `.env`. Do not regenerate
    `POSTGRES_PASSWORD` after the first deploy: the database volume keeps the
-   original password. Use `--rotate MBX_CACHE_TOKEN` to rotate the runner token.
+   original password.
 3. Leave the domain empty. The cache needs no proxy route.
 4. Deploy, and wait until all three services are healthy.
 
@@ -35,9 +35,6 @@ The stack creates a Docker network named `mbx-cache`, with the cache at
 ```yaml
 services:
   runner:
-    environment:
-      MBX_REMOTE_TOKEN: '${MBX_CACHE_TOKEN}'
-      MISE_TASK_CACHE_REMOTE_TOKEN: '${MBX_CACHE_TOKEN}'
     networks: [default, mbx-cache]
 networks:
   mbx-cache:
@@ -53,8 +50,18 @@ namespace = "acme/backend"
 mode = "read-write"
 ```
 
-Deploy the cache before the runners, since they need the network to exist.
-Traffic on this network is plain HTTP, so use it only on a single trusted host.
+A runner that already exists can join without a redeploy:
+`docker network connect mbx-cache <container>`. Deploy the cache before the
+runners, since they need the network to exist.
+
+### No token
+
+The cache accepts anonymous reads and writes. mbx refuses to send a bearer
+token over plain HTTP to anything but a loopback address, so a token cannot
+reach `http://mbx-cache:7543`. Access control is the network itself: only
+containers joined to `mbx-cache` can reach the cache, and each of them may
+write to it. Join only runners you trust with that. mbx still publishes only
+from pushes to protected branches; pull requests read.
 
 ## Retention
 

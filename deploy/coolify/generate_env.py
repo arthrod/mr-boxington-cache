@@ -7,7 +7,8 @@
 Prints KEY=value lines ready to paste into Coolify's environment editor, and
 optionally writes them to a file. Secrets already present in an existing file
 are kept: rotating POSTGRES_PASSWORD after the database volume is initialized
-locks the cache out of its own metadata.
+locks the cache out of its own metadata. Runners need no secret: the cache
+accepts anonymous requests on its private network.
 
     uv run deploy/coolify/generate_env.py              # print to stdout
     uv run deploy/coolify/generate_env.py -o .env      # write (or update) .env
@@ -20,16 +21,13 @@ import secrets
 import sys
 from pathlib import Path
 
-# Hex secrets only: they are interpolated into a postgres:// URL and a JSON
-# document by compose, so they must need neither URL nor JSON escaping.
+# Hex secrets only: compose interpolates them into a postgres:// URL, so they
+# must need no URL escaping.
 SECRETS = {
     "POSTGRES_PASSWORD": lambda: secrets.token_hex(32),
-    "MBX_CACHE_TOKEN": lambda: secrets.token_hex(32),
 }
 
 DEFAULTS = {
-    # Namespace pattern the runner token may read and write: exact, `*`, or `prefix/*`.
-    "MBX_CACHE_NAMESPACES": "*",
     # Host loopback port for debugging; runners use http://mbx-cache:7543.
     "MBX_CACHE_HOST_PORT": "7543",
     "MBX_CACHE_DATABASE_MAX_CONNECTIONS": "32",
@@ -79,9 +77,7 @@ def main() -> int:
 
     print(
         "\nRunner side (containers joined to the external `mbx-cache` network):\n"
-        "  mbx:  [remote] url = \"http://mbx-cache:7543\", namespace = \"<project>\"\n"
-        f"        MBX_REMOTE_TOKEN={env['MBX_CACHE_TOKEN']}\n"
-        f"  mise: MISE_TASK_CACHE_REMOTE_TOKEN={env['MBX_CACHE_TOKEN']}",
+        "  mbx:  [remote] url = \"http://mbx-cache:7543\", namespace = \"<project>\", no token",
         file=sys.stderr,
     )
     return 0

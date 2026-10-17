@@ -11,8 +11,10 @@ services:
       MBX_CACHE_DATA_DIR: /var/lib/mbx-cache
       MBX_CACHE_DATABASE_URL: 'postgres://mbx_cache:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/mbx_cache'
       MBX_CACHE_DATABASE_MAX_CONNECTIONS: '${MBX_CACHE_DATABASE_MAX_CONNECTIONS:-32}'
-      MBX_CACHE_TOKENS_JSON: '[{"token":"${MBX_CACHE_TOKEN:?MBX_CACHE_TOKEN is required}","read":["${MBX_CACHE_NAMESPACES:-*}"],"write":["${MBX_CACHE_NAMESPACES:-*}"]}]'
-      MBX_CACHE_ALLOW_ANONYMOUS: 'false'
+      # No tokens: mbx refuses to send one over plain HTTP to anything but
+      # loopback, and this cache is reachable only on the private `mbx-cache`
+      # network. Every container on that network may read and write.
+      MBX_CACHE_ALLOW_ANONYMOUS: 'true'
       MBX_CACHE_MAX_BLOB_BYTES: '${MBX_CACHE_MAX_BLOB_BYTES:-5368709120}'
       RUST_LOG: '${RUST_LOG:-mbx_cache=info,tower_http=info}'
     volumes:
