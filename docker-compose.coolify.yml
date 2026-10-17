@@ -15,7 +15,7 @@ services:
       # loopback, and this cache is reachable only on the private `mbx-cache`
       # network. Every container on that network may read and write.
       MBX_CACHE_ALLOW_ANONYMOUS: 'true'
-      MBX_CACHE_MAX_BLOB_BYTES: '${MBX_CACHE_MAX_BLOB_BYTES:-5368709120}'
+      MBX_CACHE_MAX_BLOB_BYTES: '${MBX_CACHE_MAX_BLOB_BYTES:-21474836480}'
       RUST_LOG: '${RUST_LOG:-mbx_cache=info,tower_http=info}'
     volumes:
       - 'blobs:/var/lib/mbx-cache'

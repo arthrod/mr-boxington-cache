@@ -31,7 +31,7 @@ DEFAULTS = {
     # Host loopback port for debugging; runners use http://mbx-cache:7543.
     "MBX_CACHE_HOST_PORT": "7543",
     "MBX_CACHE_DATABASE_MAX_CONNECTIONS": "32",
-    "MBX_CACHE_MAX_BLOB_BYTES": str(5 * 1024**3),
+    "MBX_CACHE_MAX_BLOB_BYTES": str(20 * 1024**3),
     "MBX_CACHE_RETENTION_DAYS": "30",
     "MBX_CACHE_SWEEP_INTERVAL_S": "21600",
     "RUST_LOG": "mbx_cache=info,tower_http=info",
