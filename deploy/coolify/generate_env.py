@@ -34,6 +34,9 @@ DEFAULTS = {
     "MBX_CACHE_MAX_BLOB_BYTES": str(20 * 1024**3),
     "MBX_CACHE_RETENTION_DAYS": "30",
     "MBX_CACHE_SWEEP_INTERVAL_S": "21600",
+    "MBX_CACHE_MAX_SIZE_GIB": "70",
+    "MBX_CACHE_EVICT_TO_PERCENT": "90",
+    "MBX_CACHE_SIZE_CHECK_INTERVAL_S": "300",
     "RUST_LOG": "mbx_cache=info,tower_http=info",
 }
 

@@ -69,3 +69,11 @@ Filesystem storage has no lifecycle policy, so `sweeper` deletes blob files
 older than `MBX_CACHE_RETENTION_DAYS` (default 30), then runs
 `mbx-cache --sweep-metadata-older-than-days` with the same age. Age counts from
 upload, not last use, so hot blobs are uploaded again once they expire.
+
+Age alone does not bound disk use, so `sweeper` also enforces a size cap. Every
+`MBX_CACHE_SIZE_CHECK_INTERVAL_S` (default 300) it measures the blob store, and
+once it exceeds `MBX_CACHE_MAX_SIZE_GIB` (default 70) it deletes the least
+recently accessed blobs until usage falls to `MBX_CACHE_EVICT_TO_PERCENT`
+(default 90) of the cap. Recency comes from file access times, which `relatime`
+mounts update at most once a day. Evicted blobs read as cache misses, and their
+metadata goes with the next age sweep.
