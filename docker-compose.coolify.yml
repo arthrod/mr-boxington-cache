@@ -103,18 +103,41 @@ services:
       - '-c'
     command:
       - |
+        last_age_sweep=0
         while :; do
-          echo "sweep: removing blobs and metadata older than $${MBX_CACHE_RETENTION_DAYS}d"
-          find /var/lib/mbx-cache/blobs -type f -mmin +$$(( MBX_CACHE_RETENTION_DAYS * 1440 )) -delete
-          find /var/lib/mbx-cache/blobs -mindepth 1 -type d -empty -mmin +60 -delete
-          find /var/tmp/mbx-cache -type f -mmin +1440 -delete
-          mbx-cache --sweep-metadata-older-than-days "$${MBX_CACHE_RETENTION_DAYS}" && touch /tmp/last-sweep
-          sleep "$${MBX_CACHE_SWEEP_INTERVAL_S}"
+          now=$$(date +%s)
+          if [ $$(( now - last_age_sweep )) -ge "$${MBX_CACHE_SWEEP_INTERVAL_S}" ]; then
+            echo "sweep: removing blobs and metadata older than $${MBX_CACHE_RETENTION_DAYS}d"
+            find /var/lib/mbx-cache/blobs -type f -mmin +$$(( MBX_CACHE_RETENTION_DAYS * 1440 )) -delete
+            find /var/lib/mbx-cache/blobs -mindepth 1 -type d -empty -mmin +60 -delete
+            find /var/tmp/mbx-cache -type f -mmin +1440 -delete
+            mbx-cache --sweep-metadata-older-than-days "$${MBX_CACHE_RETENTION_DAYS}" && touch /tmp/last-sweep
+            last_age_sweep=$$now
+          fi
+          # Size cap: once blobs exceed MBX_CACHE_MAX_SIZE_GIB, evict the least
+          # recently accessed blobs until usage falls to MBX_CACHE_EVICT_TO_PERCENT
+          # of the cap. Blobs go first and metadata follows on the next age sweep,
+          # the same order the age sweep uses, so a missing blob is a cache miss.
+          max_kb=$$(( MBX_CACHE_MAX_SIZE_GIB * 1048576 ))
+          used_kb=$$(du -sk /var/lib/mbx-cache/blobs | cut -f1)
+          if [ "$$used_kb" -gt "$$max_kb" ]; then
+            target_kb=$$(( max_kb * MBX_CACHE_EVICT_TO_PERCENT / 100 ))
+            echo "sweep: blobs use $$(( used_kb / 1048576 )) GiB, over the $${MBX_CACHE_MAX_SIZE_GIB} GiB cap; evicting least recently used blobs down to $$(( target_kb / 1048576 )) GiB"
+            find /var/lib/mbx-cache/blobs -type f -printf '%A@ %k %p\n' | sort -n \
+              | awk -v excess="$$(( used_kb - target_kb ))" '{ if (freed >= excess) exit; print $$3; freed += $$2 }' \
+              | xargs -r -d '\n' rm -f --
+            find /var/lib/mbx-cache/blobs -mindepth 1 -type d -empty -delete
+            echo "sweep: blobs now use $$(( $$(du -sk /var/lib/mbx-cache/blobs | cut -f1) / 1048576 )) GiB"
+          fi
+          sleep "$${MBX_CACHE_SIZE_CHECK_INTERVAL_S}"
         done
     environment:
       MBX_CACHE_DATABASE_URL: 'postgres://mbx_cache:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/mbx_cache'
       MBX_CACHE_RETENTION_DAYS: '${MBX_CACHE_RETENTION_DAYS:-30}'
       MBX_CACHE_SWEEP_INTERVAL_S: '${MBX_CACHE_SWEEP_INTERVAL_S:-21600}'
+      MBX_CACHE_MAX_SIZE_GIB: '${MBX_CACHE_MAX_SIZE_GIB:-70}'
+      MBX_CACHE_EVICT_TO_PERCENT: '${MBX_CACHE_EVICT_TO_PERCENT:-90}'
+      MBX_CACHE_SIZE_CHECK_INTERVAL_S: '${MBX_CACHE_SIZE_CHECK_INTERVAL_S:-300}'
     volumes:
       - 'blobs:/var/lib/mbx-cache'
       - 'staging:/var/tmp/mbx-cache'
