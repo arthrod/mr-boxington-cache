@@ -17,17 +17,21 @@ use mbx_cache_protocol::{
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io,
-    sync::Arc,
-    time::Instant,
+    sync::{Arc, Mutex, Weak},
+    time::{Duration, Instant},
 };
 use tempfile::NamedTempFile;
-use tokio::io::AsyncWriteExt;
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{OwnedSemaphorePermit, Semaphore},
+};
 use tower_http::{
     compression::{CompressionLayer, CompressionLevel},
     decompression::RequestDecompressionLayer,
     limit::RequestBodyLimitLayer,
+    timeout::RequestBodyTimeoutLayer,
     trace::TraceLayer,
 };
 
@@ -46,6 +50,13 @@ use crate::{
 const BLOB_PACK_HEADER_BYTES: usize = mbx_cache_protocol::BLOB_PACK_HEADER_BYTES as usize;
 const MAX_PACK_STORAGE_READS: usize = 16;
 const MAX_ACTION_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
+const REQUEST_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a served blob waits before its access is written. The database
+/// refreshes an access at most once an hour, so this delay is invisible to it.
+const ACCESS_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
+/// Accesses held between flushes. Past this, new ones are dropped: each costs
+/// a little memory, and losing one only makes eviction less well informed.
+const MAX_PENDING_ACCESSES: usize = 100_000;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -53,7 +64,10 @@ pub struct AppState {
     pub metadata: Arc<dyn MetadataStore>,
     pub auth: Authorizer,
     pub max_blob_bytes: u64,
+    pub pack_store_concurrency: usize,
+    spool: SpoolBudget,
     metrics: Arc<Metrics>,
+    access: Arc<PendingAccess>,
 }
 
 impl AppState {
@@ -62,14 +76,137 @@ impl AppState {
         metadata: Arc<dyn MetadataStore>,
         auth: Authorizer,
         max_blob_bytes: u64,
+        pack_store_concurrency: usize,
+        max_spool_bytes: u64,
     ) -> Self {
+        let access = Arc::new(PendingAccess {
+            metadata: metadata.clone(),
+            pending: Mutex::default(),
+        });
+        tokio::spawn(flush_access(Arc::downgrade(&access)));
         Self {
             blobs,
             metadata,
             auth,
             max_blob_bytes,
+            pack_store_concurrency,
+            spool: SpoolBudget::new(max_spool_bytes),
             metrics: Arc::new(Metrics::new()),
+            access,
         }
+    }
+}
+
+/// Bytes uploads may hold spooled on local disk at once, counted in KiB.
+///
+/// An upload reserves its declared size before it writes a byte, and a full
+/// budget refuses it rather than queueing it: a waiting upload would still
+/// hold its connection, and the disk the spool shares may be the database's.
+#[derive(Clone)]
+struct SpoolBudget(Option<Arc<Semaphore>>);
+
+impl SpoolBudget {
+    /// No budget when `max_bytes` is zero.
+    fn new(max_bytes: u64) -> Self {
+        Self((max_bytes > 0).then(|| {
+            let permits = usize::try_from(max_bytes.div_ceil(1024))
+                .unwrap_or(usize::MAX)
+                .min(Semaphore::MAX_PERMITS);
+            Arc::new(Semaphore::new(permits))
+        }))
+    }
+
+    /// Hold room for `bytes` until the returned permit drops.
+    fn reserve(&self, bytes: u64) -> Result<Option<OwnedSemaphorePermit>, ApiError> {
+        let Some(semaphore) = &self.0 else {
+            return Ok(None);
+        };
+        let permits = u32::try_from(bytes.div_ceil(1024))
+            .map_err(|_| ApiError::too_large("blob exceeds the upload spool"))?;
+        semaphore
+            .clone()
+            .try_acquire_many_owned(permits)
+            .map(Some)
+            .map_err(|_| ApiError::unavailable("upload spool is full, retry later"))
+    }
+}
+
+/// Blob accesses served but not yet written, by namespace.
+///
+/// A read that wrote its own access held a database connection for it, and
+/// under a burst of builds those writes took the connections the reads
+/// themselves were waiting for. Reads now only note their digests here, and
+/// one background task writes them, one statement per namespace.
+struct PendingAccess {
+    metadata: Arc<dyn MetadataStore>,
+    pending: Mutex<Pending>,
+}
+
+#[derive(Default)]
+struct Pending {
+    namespaces: HashMap<String, HashSet<Digest>>,
+    /// Digests across all namespaces, so a read need not count them.
+    len: usize,
+}
+
+impl PendingAccess {
+    /// Note a read so a future garbage collector can evict by real use.
+    ///
+    /// Losing an access record only makes eviction slightly less well
+    /// informed, so this never fails a served blob, nor makes it wait.
+    fn record(&self, namespace: &str, digests: &[Digest]) {
+        let mut pending = self.pending.lock().expect("access lock poisoned");
+        let Pending { namespaces, len } = &mut *pending;
+        // An entry is only made for a digest that fits, so the limit also
+        // bounds how many namespaces are held.
+        if digests.is_empty() || *len >= MAX_PENDING_ACCESSES {
+            return;
+        }
+        if !namespaces.contains_key(namespace) {
+            namespaces.insert(namespace.to_owned(), HashSet::new());
+        }
+        let held = namespaces.get_mut(namespace).expect("inserted above");
+        // Most reads are of blobs already pending, so test before cloning.
+        for digest in digests {
+            if *len >= MAX_PENDING_ACCESSES {
+                break;
+            }
+            if !held.contains(digest) {
+                held.insert(digest.clone());
+                *len += 1;
+            }
+        }
+    }
+
+    async fn flush(&self) {
+        let pending = std::mem::take(&mut *self.pending.lock().expect("access lock poisoned"));
+        let mut failed = 0_usize;
+        let mut last_error = None;
+        for (namespace, digests) in pending.namespaces {
+            let digests = digests.into_iter().collect::<Vec<_>>();
+            for chunk in digests.chunks(MAX_BATCH_ITEMS) {
+                if let Err(error) = self.metadata.touch_blobs(&namespace, chunk).await {
+                    failed += 1;
+                    last_error = Some((namespace.clone(), error));
+                }
+            }
+        }
+        if let Some((namespace, error)) = last_error {
+            tracing::warn!(%error, %namespace, failed, "could not record blob access");
+        }
+    }
+}
+
+/// Write pending accesses until the state that owns them is dropped.
+async fn flush_access(access: Weak<PendingAccess>) {
+    let mut interval = tokio::time::interval(ACCESS_FLUSH_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        let Some(access) = access.upgrade() else {
+            return;
+        };
+        access.flush().await;
     }
 }
 
@@ -127,17 +264,21 @@ pub fn router(state: AppState) -> Router {
         // Fastest: rustc artifacts still compress well below level 1's cost,
         // and a cache server's CPU is better spent serving than squeezing.
         .layer(CompressionLayer::new().quality(CompressionLevel::Fastest))
+        // An idle bound, not a total one: a multi-gigabyte upload may take
+        // minutes, but a client that stops sending must not hold its spool file.
+        .layer(RequestBodyTimeoutLayer::new(REQUEST_BODY_IDLE_TIMEOUT))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
-/// Note a read so a future garbage collector can evict by real use.
+/// Drop the row of a blob the metadata lists but storage no longer holds.
 ///
-/// Losing an access record only makes eviction slightly less well informed, so
-/// this never turns a served blob into a failed request.
-async fn record_blob_access(state: &AppState, namespace: &str, digests: &[Digest]) {
-    if let Err(error) = state.metadata.touch_blobs(namespace, digests).await {
-        tracing::debug!(%error, "could not record blob access");
+/// A row removed while another upload recreates the object costs one more
+/// upload, which registers the row again.
+async fn forget_missing_blob(metadata: &dyn MetadataStore, namespace: &str, digest: &Digest) {
+    tracing::info!(namespace, hash = %digest.hash, "forgetting a visible blob missing from storage");
+    if let Err(error) = metadata.forget_blob(namespace, digest).await {
+        tracing::warn!(%error, "could not forget a blob missing from storage");
     }
 }
 
@@ -154,7 +295,10 @@ async fn capabilities(State(state): State<AppState>) -> impl IntoResponse {
     capabilities.digest_algorithms = vec!["blake3".into(), "sha256".into()];
     capabilities.compressors = vec!["identity".into(), "zstd".into()];
     capabilities.action_kinds = BTreeMap::from([
-        ("build-script".into(), ActionKindCapability::new(4, 1)),
+        (
+            "build-script".into(),
+            ActionKindCapability::new(*crate::model::BUILD_SCRIPT_ACTION_SCHEMAS.end(), 1),
+        ),
         ("cc".into(), ActionKindCapability::new(1, 1)),
         ("rustc".into(), ActionKindCapability::new(1, 1)),
         ("task".into(), ActionKindCapability::new(1, 1)),
@@ -190,13 +334,13 @@ async fn get_blob(
     {
         return Err(ApiError::not_found("blob not found"));
     }
-    record_blob_access(&state, &namespace, std::slice::from_ref(&digest)).await;
-    let blob = state
-        .blobs
-        .get(&digest)
-        .await
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found("blob not found"))?;
+    state
+        .access
+        .record(&namespace, std::slice::from_ref(&digest));
+    let Some(blob) = state.blobs.get(&digest).await.map_err(ApiError::internal)? else {
+        forget_missing_blob(state.metadata.as_ref(), &namespace, &digest).await;
+        return Err(ApiError::not_found("blob not found"));
+    };
     state.metrics.inc_blob_hit();
     Response::builder()
         .status(StatusCode::OK)
@@ -220,6 +364,7 @@ async fn put_blob(
     if digest.size > state.max_blob_bytes {
         return Err(ApiError::too_large("blob exceeds configured limit"));
     }
+    let _spool = state.spool.reserve(digest.size)?;
     let temp = NamedTempFile::new().map_err(ApiError::internal)?;
     let path = temp.path().to_owned();
     let mut file = tokio::fs::File::create(&path)
@@ -288,9 +433,11 @@ struct BlobPackReceipt {
 /// request at a time spends most of its time in round trips. Each frame is
 /// verified against the digest it declares before it is stored, exactly as a
 /// single upload is: a pack is a transport for uploads, not a weaker kind of
-/// one. A frame that fails ends the request, which may leave the blobs before
-/// it stored -- they are content-addressed and immutable, so storing one that a
-/// client then re-sends individually costs nothing but the transfer.
+/// one. Up to `pack_store_concurrency` frames are stored at once, because each
+/// store is a round trip to object storage. A frame that fails ends the
+/// request once the stores in flight finish, which may leave other blobs of the
+/// pack stored -- they are content-addressed and immutable, so storing one that
+/// a client then re-sends individually costs nothing but the transfer.
 async fn put_blob_pack(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -312,33 +459,58 @@ async fn put_blob_pack(
     let mut reader = PackReader::new(state.max_blob_bytes, declared_blobs, declared_bytes);
     let mut stream = body.into_data_stream();
     let mut frame: Option<PackFrame> = None;
-    let mut created = 0;
-    let mut existing = 0;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| ApiError::bad_request(error.to_string()))?;
-        for event in reader.push(&chunk).map_err(pack_error)? {
-            match event {
-                PackEvent::Started(digest) => {
-                    frame = Some(PackFrame::new(digest).await?);
-                }
-                PackEvent::Payload(payload) => {
-                    frame
-                        .as_mut()
-                        .ok_or_else(|| ApiError::internal("payload outside a blob pack frame"))?
-                        .write(&payload)
-                        .await?;
-                }
-                PackEvent::Complete => {
-                    let finished = frame.take().ok_or_else(|| {
-                        ApiError::internal("blob pack frame ended before it began")
-                    })?;
-                    match finished.store(&state, &namespace).await? {
-                        PutOutcome::Created => created += 1,
-                        PutOutcome::AlreadyExists => existing += 1,
+    // Spawned rather than polled in place: a dropped request detaches its
+    // stores instead of cutting one off between staging and cleanup.
+    let mut stores = stream::FuturesUnordered::new();
+    let mut receipt = BlobPackReceipt {
+        created: 0,
+        existing: 0,
+    };
+    let read = async {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| ApiError::bad_request(error.to_string()))?;
+            for event in reader.push(&chunk).map_err(pack_error)? {
+                match event {
+                    PackEvent::Started(digest) => {
+                        let spool = state.spool.reserve(digest.size)?;
+                        frame = Some(PackFrame::new(digest, spool).await?);
+                    }
+                    PackEvent::Payload(payload) => {
+                        frame
+                            .as_mut()
+                            .ok_or_else(|| ApiError::internal("payload outside a blob pack frame"))?
+                            .write(&payload)
+                            .await?;
+                    }
+                    PackEvent::Complete => {
+                        let mut finished = frame.take().ok_or_else(|| {
+                            ApiError::internal("blob pack frame ended before it began")
+                        })?;
+                        finished.verify().await?;
+                        // Waiting here also bounds the spooled frames on disk.
+                        if stores.len() >= state.pack_store_concurrency
+                            && let Some(stored) = stores.next().await
+                        {
+                            receipt.count(stored)?;
+                        }
+                        let state = state.clone();
+                        let namespace = namespace.clone();
+                        stores.push(tokio::spawn(async move {
+                            finished.store(&state, &namespace).await
+                        }));
                     }
                 }
             }
         }
+        while let Some(stored) = stores.next().await {
+            receipt.count(stored)?;
+        }
+        Ok::<_, ApiError>(())
+    }
+    .await;
+    if let Err(error) = read {
+        while stores.next().await.is_some() {}
+        return Err(error);
     }
     reader.finish().map_err(pack_error)?;
     if reader.blobs() != declared_blobs || reader.payload_bytes() != declared_bytes {
@@ -349,9 +521,22 @@ async fn put_blob_pack(
     state.metrics.inc_blob_pack_upload(reader.blobs());
     Ok((
         [(header::CONTENT_TYPE, BLOB_PACK_RECEIPT_MEDIA_TYPE)],
-        Json(BlobPackReceipt { created, existing }),
+        Json(receipt),
     )
         .into_response())
+}
+
+impl BlobPackReceipt {
+    fn count(
+        &mut self,
+        stored: Result<Result<PutOutcome, ApiError>, tokio::task::JoinError>,
+    ) -> Result<(), ApiError> {
+        match stored.map_err(ApiError::internal)?? {
+            PutOutcome::Created => self.created += 1,
+            PutOutcome::AlreadyExists => self.existing += 1,
+        }
+        Ok(())
+    }
 }
 
 /// One frame of an uploaded pack, spooled and hashed as it arrives.
@@ -362,11 +547,13 @@ struct PackFrame {
     size: u64,
     blake3: blake3::Hasher,
     sha256: sha2::Sha256,
+    /// Last, so it is released after `temp` removes the spooled file.
+    _spool: Option<OwnedSemaphorePermit>,
 }
 
 impl PackFrame {
     /// Start spooling and hashing the payload declared by one frame header.
-    async fn new(digest: Digest) -> Result<Self, ApiError> {
+    async fn new(digest: Digest, spool: Option<OwnedSemaphorePermit>) -> Result<Self, ApiError> {
         let temp = NamedTempFile::new().map_err(ApiError::internal)?;
         let file = tokio::fs::File::create(temp.path())
             .await
@@ -378,6 +565,7 @@ impl PackFrame {
             size: 0,
             blake3: blake3::Hasher::new(),
             sha256: sha2::Sha256::new(),
+            _spool: spool,
         })
     }
 
@@ -402,8 +590,8 @@ impl PackFrame {
             .map_err(ApiError::internal)
     }
 
-    /// Verify and publish a completed frame as an ordinary blob upload.
-    async fn store(mut self, state: &AppState, namespace: &str) -> Result<PutOutcome, ApiError> {
+    /// Check a completed frame against the digest it declared.
+    async fn verify(&mut self) -> Result<(), ApiError> {
         self.file.flush().await.map_err(ApiError::internal)?;
         let actual = match self
             .digest
@@ -411,13 +599,18 @@ impl PackFrame {
             .map_err(ApiError::bad_request)?
         {
             Algorithm::Blake3 => self.blake3.finalize().to_hex().to_string(),
-            Algorithm::Sha256 => hex::encode(self.sha256.finalize()),
+            Algorithm::Sha256 => hex::encode(std::mem::take(&mut self.sha256).finalize()),
         };
         if self.size != self.digest.size || actual != self.digest.hash {
             return Err(ApiError::bad_request(
                 "packed blob does not match its declared digest",
             ));
         }
+        Ok(())
+    }
+
+    /// Publish a verified frame as an ordinary blob upload.
+    async fn store(self, state: &AppState, namespace: &str) -> Result<PutOutcome, ApiError> {
         let outcome = state
             .blobs
             .put(&self.digest, self.temp.path())
@@ -534,7 +727,7 @@ async fn pack_blobs(
             return Err(ApiError::internal(error));
         }
     };
-    record_blob_access(&state, &namespace, &visible).await;
+    state.access.record(&namespace, &visible);
     let missing_blobs = requested.len().saturating_sub(visible.len()) as u64;
     let mut pack_guard = state.metrics.start_pack(
         request_started,
@@ -545,6 +738,7 @@ async fn pack_blobs(
     let mut pack_bytes = BLOB_PACK_MAGIC.len() as u64;
     let mut pack_payload_bytes = 0_u64;
     let store = state.blobs.clone();
+    let metadata = state.metadata.clone();
     let metrics = state.metrics.clone();
     let mut entries = Vec::new();
     for digest in visible {
@@ -570,6 +764,8 @@ async fn pack_blobs(
         yield Bytes::from_static(BLOB_PACK_MAGIC);
         let reads = stream::iter(entries.into_iter().map(|(header, digest)| {
             let store = store.clone();
+            let metadata = metadata.clone();
+            let namespace = namespace.clone();
             let stream_metrics = stream_metrics.clone();
             async move {
                 let started = Instant::now();
@@ -580,6 +776,7 @@ async fn pack_blobs(
                     }
                     Ok(None) => {
                         stream_metrics.observe_pack_storage_get("missing", started.elapsed());
+                        forget_missing_blob(metadata.as_ref(), &namespace, &digest).await;
                         return Err(io::Error::new(io::ErrorKind::NotFound, "visible blob is missing from storage"));
                     }
                     Err(error) => {
@@ -886,12 +1083,10 @@ async fn validate_tree(state: &AppState, namespace: &str, root: &Digest) -> Resu
         {
             return Err(ApiError::unprocessable("directory object is missing"));
         }
-        let mut blob = state
-            .blobs
-            .get(&digest)
-            .await
-            .map_err(ApiError::internal)?
-            .ok_or_else(|| ApiError::unprocessable("directory object is missing"))?;
+        let Some(mut blob) = state.blobs.get(&digest).await.map_err(ApiError::internal)? else {
+            forget_missing_blob(state.metadata.as_ref(), namespace, &digest).await;
+            return Err(ApiError::unprocessable("directory object is missing"));
+        };
         let mut bytes = Vec::with_capacity(digest.size as usize);
         while let Some(chunk) = blob.stream.next().await {
             bytes.extend_from_slice(&chunk.map_err(ApiError::internal)?);
@@ -909,8 +1104,22 @@ async fn validate_tree(state: &AppState, namespace: &str, root: &Digest) -> Resu
             ));
         }
         validate_directory_entries(&directory)?;
+        let mut files = HashSet::new();
         for file in directory.files {
-            require_blob(state, namespace, &file.digest, "file blob").await?;
+            validate_digest(&file.digest)?;
+            files.insert(file.digest);
+        }
+        // One query per directory: a directory can list tens of thousands of files.
+        let files: Vec<Digest> = files.into_iter().collect();
+        if state
+            .metadata
+            .visible_blobs(namespace, &files)
+            .await
+            .map_err(ApiError::internal)?
+            .len()
+            != files.len()
+        {
+            return Err(ApiError::unprocessable("file blob is missing"));
         }
         pending.push(Visit::Exit(digest));
         pending.extend(
@@ -978,9 +1187,9 @@ fn validate_build_script_action(
     value: serde_json::Value,
     version: u64,
 ) -> Result<ActionKind, ApiError> {
-    // Schema 3 added `archive_timestamps`; 4 only changed which results mbx
-    // records, so both share the shape below.
-    if !(2..=4).contains(&version) {
+    if !u8::try_from(version)
+        .is_ok_and(|version| crate::model::BUILD_SCRIPT_ACTION_SCHEMAS.contains(&version))
+    {
         return Err(ApiError::unprocessable(format!(
             "unsupported build-script action schema {version}"
         )));
@@ -1240,12 +1449,10 @@ async fn read_canonical_object(
     {
         return Err(ApiError::unprocessable(format!("{label} blob is missing")));
     }
-    let mut blob = state
-        .blobs
-        .get(digest)
-        .await
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::unprocessable(format!("{label} blob is missing")))?;
+    let Some(mut blob) = state.blobs.get(digest).await.map_err(ApiError::internal)? else {
+        forget_missing_blob(state.metadata.as_ref(), namespace, digest).await;
+        return Err(ApiError::unprocessable(format!("{label} blob is missing")));
+    };
     let mut bytes = Vec::with_capacity(digest.size as usize);
     while let Some(chunk) = blob.stream.next().await {
         bytes.extend_from_slice(&chunk.map_err(ApiError::internal)?);
@@ -1294,6 +1501,9 @@ fn validate_entry(names: &mut HashSet<String>, name: &str, mode: u32) -> Result<
 }
 
 async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
+    if let Some(stats) = state.metadata.pool_stats() {
+        state.metrics.set_database_pool(stats);
+    }
     let body = state.metrics.encode().map_err(ApiError::internal)?;
     Response::builder()
         .status(StatusCode::OK)
@@ -1415,6 +1625,9 @@ impl ApiError {
     pub fn too_large(message: impl ToString) -> Self {
         Self::new(StatusCode::PAYLOAD_TOO_LARGE, message)
     }
+    pub fn unavailable(message: impl ToString) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, message)
+    }
     pub fn unprocessable(message: impl ToString) -> Self {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, message)
     }
@@ -1431,7 +1644,24 @@ impl ApiError {
             advertise_protocol: true,
         }
     }
-    pub fn internal(error: impl std::fmt::Display) -> Self {
+    pub fn internal(error: impl std::fmt::Display + 'static) -> Self {
+        // Every metadata failure arrives here, so this is the one place that
+        // can tell a full connection pool, which clears on its own, from a
+        // fault. Callers pass whatever error they hold, hence the downcast.
+        let any = &error as &dyn std::any::Any;
+        let pool_timed_out = matches!(
+            any.downcast_ref::<anyhow::Error>()
+                .and_then(|error| error.downcast_ref::<sqlx::Error>())
+                .or_else(|| any.downcast_ref::<sqlx::Error>()),
+            Some(sqlx::Error::PoolTimedOut)
+        );
+        if pool_timed_out {
+            tracing::warn!(%error, "request failed: database pool exhausted");
+            return Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "database busy, retry later",
+            );
+        }
         tracing::error!(%error, "request failed");
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
     }
@@ -1445,6 +1675,11 @@ impl IntoResponse for ApiError {
             response
                 .headers_mut()
                 .insert("mbx-cache-protocol", header::HeaderValue::from_static("1"));
+        }
+        if self.status == StatusCode::SERVICE_UNAVAILABLE {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
         }
         response
     }
@@ -1463,7 +1698,7 @@ mod tests {
         let metadata = Arc::new(MemoryMetadata::default());
         let auth = Authorizer::new(None, None, true, None).await.unwrap();
         (
-            router(AppState::new(blobs, metadata, auth, 1024 * 1024)),
+            router(AppState::new(blobs, metadata, auth, 1024 * 1024, 8, 0)),
             directory,
         )
     }
@@ -1622,21 +1857,6 @@ mod tests {
         }))
     }
 
-    /// A build-script descriptor as mbx 1.24 writes it: schema 4, with the
-    /// archive timestamp policy.
-    fn build_script_action_v4(binary_action: &Digest, archive_timestamps: Option<&str>) -> Vec<u8> {
-        canonical(serde_json::json!({
-            "archive_timestamps":archive_timestamps,
-            "binary_action":binary_action,
-            "cargo_environment":{"TARGET":"x86_64-unknown-linux-gnu"},
-            "environment":{},
-            "inputs":{"${workspace}/build.rs":{"kind":"missing"}},
-            "kind":"build-script",
-            "out_dir":null,
-            "version":4
-        }))
-    }
-
     fn compiler_metadata(kind: &str, stdout: &Digest, stderr: &Digest, version: u8) -> Vec<u8> {
         canonical(serde_json::json!({
             "kind":kind,
@@ -1724,9 +1944,26 @@ mod tests {
         let metadata = Arc::new(MemoryMetadata::default());
         let auth = Authorizer::new(None, None, true, None).await.unwrap();
         (
-            router(AppState::new(blobs, metadata, auth, max_blob_bytes)),
+            router(AppState::new(blobs, metadata, auth, max_blob_bytes, 8, 0)),
             directory,
         )
+    }
+
+    #[test]
+    fn refuses_uploads_past_the_spool_budget_until_room_frees() {
+        let Ok(None) = SpoolBudget::new(0).reserve(u64::MAX) else {
+            panic!("a zero budget is unbounded");
+        };
+        let budget = SpoolBudget::new(3 * 1024);
+        let Ok(first) = budget.reserve(2 * 1024) else {
+            panic!("the first upload fits");
+        };
+        let Err(refused) = budget.reserve(2 * 1024) else {
+            panic!("the second upload does not fit");
+        };
+        assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+        drop(first);
+        assert!(budget.reserve(2 * 1024).is_ok());
     }
 
     #[tokio::test]
@@ -1974,6 +2211,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reports_blobs_missing_from_storage_as_missing_after_a_read() {
+        let (app, directory) = test_app().await;
+        let served = upload_blob(&app, b"served alone").await;
+        let packed = upload_blob(&app, b"served in a pack").await;
+        for digest in [&served, &packed] {
+            tokio::fs::remove_file(blob_path(directory.path(), digest))
+                .await
+                .unwrap();
+        }
+
+        let uri = format!(
+            "/v1/blobs/{}/{}/{}",
+            served.algorithm, served.hash, served.size
+        );
+        let response = app
+            .clone()
+            .oneshot(request("GET", uri, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = serde_json::to_vec(&serde_json::json!({"digests":[packed]})).unwrap();
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/v1/blobs:pack".into(), Body::from(body)))
+            .await
+            .unwrap();
+        assert!(response.into_body().collect().await.is_err());
+
+        let body = serde_json::to_vec(&serde_json::json!({"digests":[served, packed]})).unwrap();
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/v1/blobs:missing".into(),
+                Body::from(body),
+            ))
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["missing"], serde_json::json!([served, packed]));
+    }
+
+    #[tokio::test]
     async fn rejects_blob_pack_when_storage_object_is_oversized() {
         let (app, directory) = test_app().await;
         let stored = upload_blob(&app, b"cached output").await;
@@ -2146,6 +2427,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checks_every_file_of_an_output_tree() {
+        let (app, _directory) = test_app().await;
+        let action = upload_blob(&app, &task_action(1)).await;
+        let metadata = upload_blob(&app, &task_metadata("task", 1)).await;
+        let artifact = upload_blob(&app, b"artifact").await;
+        let absent = digest(b"never uploaded");
+        let file = |name: &str, digest: &Digest| serde_json::json!({"digest":digest,"executable":false,"mode":420,"name":name});
+        let result_uri = format!(
+            "/v1/action-results/{}/{}/{}",
+            action.algorithm, action.hash, action.size
+        );
+        let mut statuses = Vec::new();
+        for files in [
+            vec![file("a", &artifact), file("b", &absent)],
+            vec![file("a", &artifact), file("b", &artifact)],
+        ] {
+            let root = upload_blob(
+                &app,
+                &canonical(serde_json::json!({
+                    "directories":[],
+                    "files":files,
+                    "symlinks":[],
+                    "version":1
+                })),
+            )
+            .await;
+            let result = ActionResult {
+                action: action.clone(),
+                metadata: Some(metadata.clone()),
+                output_root: Some(root),
+                version: 1,
+            };
+            let body = serde_json::to_vec(&result).unwrap();
+            statuses.push(
+                app.clone()
+                    .oneshot(request("PUT", result_uri.clone(), Body::from(body)))
+                    .await
+                    .unwrap()
+                    .status(),
+            );
+        }
+        assert_eq!(
+            statuses,
+            [StatusCode::UNPROCESSABLE_ENTITY, StatusCode::CREATED]
+        );
+    }
+
+    #[tokio::test]
     async fn advertises_action_schemas() {
         let (app, _directory) = test_app().await;
         let response = app
@@ -2158,7 +2487,7 @@ mod tests {
                 .unwrap();
         assert_eq!(body["action_kinds"]["task"]["action_schema"], 1);
         assert_eq!(body["action_kinds"]["task"]["metadata_schema"], 1);
-        assert_eq!(body["action_kinds"]["build-script"]["action_schema"], 4);
+        assert_eq!(body["action_kinds"]["build-script"]["action_schema"], 5);
         assert_eq!(body["action_kinds"]["build-script"]["metadata_schema"], 1);
         assert_eq!(body["action_kinds"]["cc"]["action_schema"], 1);
         assert_eq!(body["action_kinds"]["cc"]["metadata_schema"], 1);
@@ -2238,21 +2567,6 @@ mod tests {
         );
     }
 
-    /// mbx names clippy-driver beside rustc in the compiler identity of a
-    /// clippy compilation.
-    #[tokio::test]
-    async fn publishes_rustc_results_compiled_through_a_driver() {
-        let (app, _directory) = test_app().await;
-        let source = digest(b"pub fn widget() {}\n");
-        let mut action: serde_json::Value =
-            serde_json::from_slice(&rustc_action(&source, 1)).unwrap();
-        action["compiler"]["driver"] = "clippy 0.1.97 (test)".into();
-        assert_eq!(
-            publish_compiler_result(&app, &canonical(action), "rustc").await,
-            StatusCode::CREATED
-        );
-    }
-
     #[tokio::test]
     async fn publishes_build_script_results() {
         let (app, _directory) = test_app().await;
@@ -2265,38 +2579,6 @@ mod tests {
             )
             .await,
             StatusCode::CREATED
-        );
-    }
-
-    #[tokio::test]
-    async fn publishes_schema_4_build_script_results() {
-        for archive_timestamps in [None, Some("1")] {
-            let (app, _directory) = test_app().await;
-            let binary_action = digest(b"build script binary action");
-            assert_eq!(
-                publish_compiler_result(
-                    &app,
-                    &build_script_action_v4(&binary_action, archive_timestamps),
-                    "build-script",
-                )
-                .await,
-                StatusCode::CREATED
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn rejects_unknown_build_script_schemas() {
-        let (app, _directory) = test_app().await;
-        let binary_action = digest(b"build script binary action");
-        assert_eq!(
-            publish_compiler_result(
-                &app,
-                &build_script_action(&binary_action, 5),
-                "build-script",
-            )
-            .await,
-            StatusCode::UNPROCESSABLE_ENTITY
         );
     }
 
@@ -2469,6 +2751,129 @@ mod tests {
         }
     }
 
+    /// A blob store whose writes take a fixed time, like a remote object store.
+    struct SlowStore {
+        inner: FilesystemStore,
+        delay: std::time::Duration,
+        fail: Option<Digest>,
+        started: std::sync::atomic::AtomicUsize,
+        finished: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for SlowStore {
+        async fn get(&self, digest: &Digest) -> anyhow::Result<Option<crate::storage::Blob>> {
+            self.inner.get(digest).await
+        }
+
+        async fn put(
+            &self,
+            digest: &Digest,
+            source: &std::path::Path,
+        ) -> anyhow::Result<PutOutcome> {
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail.as_ref() == Some(digest) {
+                anyhow::bail!("storage refused the blob");
+            }
+            tokio::time::sleep(self.delay).await;
+            let outcome = self.inner.put(digest, source).await;
+            self.finished
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            outcome
+        }
+    }
+
+    async fn app_with_slow_store(
+        delay: std::time::Duration,
+        fail: Option<Digest>,
+    ) -> (Router, Arc<SlowStore>, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let blobs = Arc::new(SlowStore {
+            inner: FilesystemStore::new(directory.path()).await.unwrap(),
+            delay,
+            fail,
+            started: Default::default(),
+            finished: Default::default(),
+        });
+        let metadata = Arc::new(MemoryMetadata::default());
+        let auth = Authorizer::new(None, None, true, None).await.unwrap();
+        (
+            router(AppState::new(
+                blobs.clone(),
+                metadata,
+                auth,
+                1024 * 1024,
+                8,
+                0,
+            )),
+            blobs,
+            directory,
+        )
+    }
+
+    fn numbered_pack(count: usize) -> (Vec<Digest>, Vec<u8>, u64) {
+        let payloads: Vec<Vec<u8>> = (0..count)
+            .map(|index| format!("packed blob {index}").into_bytes())
+            .collect();
+        let digests: Vec<Digest> = payloads.iter().map(|bytes| digest(bytes)).collect();
+        let entries: Vec<(&Digest, &[u8])> = digests
+            .iter()
+            .zip(&payloads)
+            .map(|(digest, bytes)| (digest, bytes.as_slice()))
+            .collect();
+        let bytes = digests.iter().map(|digest| digest.size).sum();
+        let pack = encode_blob_pack(&entries);
+        (digests, pack, bytes)
+    }
+
+    #[tokio::test]
+    async fn stores_the_blobs_of_a_pack_concurrently() {
+        let delay = std::time::Duration::from_millis(200);
+        let (app, store, _directory) = app_with_slow_store(delay, None).await;
+        let (digests, pack, bytes) = numbered_pack(16);
+
+        let started = Instant::now();
+        let response = app
+            .oneshot(pack_request(pack, digests.len() as u64, bytes))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["created"], 16);
+        assert_eq!(body["existing"], 0);
+        assert_eq!(store.finished.load(std::sync::atomic::Ordering::SeqCst), 16);
+        eprintln!("16 blobs, 200 ms per put: {elapsed:?}");
+        // In turn this is 16 x 200 ms; eight at a time it is about 2 x 200 ms.
+        assert!(elapsed < delay * 6, "took {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn fails_a_pack_when_one_store_fails_after_the_others_finish() {
+        let (digests, pack, bytes) = numbered_pack(16);
+        let (app, store, _directory) = app_with_slow_store(
+            std::time::Duration::from_millis(50),
+            Some(digests[0].clone()),
+        )
+        .await;
+
+        let response = app
+            .oneshot(pack_request(pack, digests.len() as u64, bytes))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // Every other store that began ran to its end before the response, so
+        // none was cut off between staging and cleanup.
+        let started = store.started.load(std::sync::atomic::Ordering::SeqCst);
+        let finished = store.finished.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(finished, started - 1);
+    }
+
     #[tokio::test]
     async fn counts_blobs_an_uploaded_pack_already_held() {
         let (app, _directory) = test_app().await;
@@ -2514,6 +2919,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn stores_nothing_after_a_packed_blob_that_does_not_match_its_digest() {
+        let (app, store, _directory) = app_with_slow_store(std::time::Duration::ZERO, None).await;
+        let claimed = digest(b"claimed contents");
+        let (_, rest, bytes) = numbered_pack(4);
+        let mut pack = encode_blob_pack(&[(&claimed, b"swapped contents".as_slice())]);
+        pack.extend_from_slice(&rest[BLOB_PACK_MAGIC.len()..]);
+
+        let response = app
+            .oneshot(pack_request(pack, 5, claimed.size + bytes))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(store.started.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -2894,39 +3316,126 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_unknown_rustc_action_fields() {
+    async fn ignores_unknown_action_fields() {
         let (app, _directory) = test_app().await;
         let source = digest(b"pub fn widget() {}\n");
         let mut action: serde_json::Value =
             serde_json::from_slice(&rustc_action(&source, 1)).unwrap();
         action["unknown"] = true.into();
-        let action = upload_blob(&app, &canonical(action)).await;
-        let result_uri = format!(
+        action["compiler"]["unknown"] = true.into();
+        assert_eq!(
+            publish_compiler_result(&app, &canonical(action), "rustc").await,
+            StatusCode::CREATED
+        );
+    }
+
+    /// Descriptors serialized by the client releases named in each file, so a
+    /// client schema change that the service cannot read fails here first.
+    #[tokio::test]
+    async fn accepts_client_action_descriptors() {
+        for (kind, action) in [
+            (
+                "rustc",
+                &include_bytes!("../tests/fixtures/client-actions/rustc-mbx-1.29.0.json")[..],
+            ),
+            (
+                "cc",
+                include_bytes!("../tests/fixtures/client-actions/cc-mbx-1.29.0.json"),
+            ),
+            (
+                "build-script",
+                include_bytes!("../tests/fixtures/client-actions/build-script-mbx-1.28.0.json"),
+            ),
+            (
+                "build-script",
+                include_bytes!("../tests/fixtures/client-actions/build-script-mbx-1.29.0.json"),
+            ),
+        ] {
+            let (app, _directory) = test_app().await;
+            assert_eq!(
+                publish_compiler_result(&app, action, kind).await,
+                StatusCode::CREATED,
+                "{kind}: {}",
+                String::from_utf8_lossy(action)
+            );
+        }
+
+        let (app, _directory) = test_app().await;
+        let action = upload_blob(
+            &app,
+            include_bytes!("../tests/fixtures/client-actions/task-mise-2026.10.24.json"),
+        )
+        .await;
+        let metadata = upload_blob(&app, &task_metadata("task", 1)).await;
+        let uri = format!(
             "/v1/action-results/{}/{}/{}",
             action.algorithm, action.hash, action.size
         );
         let body = serde_json::to_vec(&ActionResult {
             action,
-            metadata: None,
+            metadata: Some(metadata),
             output_root: None,
             version: 1,
         })
         .unwrap();
-
-        let response = app
-            .oneshot(request("PUT", result_uri, Body::from(body)))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let body: serde_json::Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        assert!(
-            body["error"]
-                .as_str()
+        assert_eq!(
+            app.oneshot(request("PUT", uri, Body::from(body)))
+                .await
                 .unwrap()
-                .starts_with("invalid rustc action:")
+                .status(),
+            StatusCode::CREATED
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_action_kinds_and_schemas() {
+        let (app, _directory) = test_app().await;
+        let source = digest(b"pub fn widget() {}\n");
+        let mut unknown_kind: serde_json::Value =
+            serde_json::from_slice(&rustc_action(&source, 1)).unwrap();
+        unknown_kind["kind"] = "linker".into();
+        for (action, error) in [
+            (
+                canonical(unknown_kind),
+                "unsupported action kind \"linker\"",
+            ),
+            (
+                build_script_action(&source, 1),
+                "unsupported build-script action schema 1",
+            ),
+            (
+                build_script_action(&source, 6),
+                "unsupported build-script action schema 6",
+            ),
+            (
+                rustc_action(&source, 2),
+                "unsupported rustc action schema 2",
+            ),
+            (cc_action(&source, 2), "unsupported cc action schema 2"),
+        ] {
+            let action = upload_blob(&app, &action).await;
+            let uri = format!(
+                "/v1/action-results/{}/{}/{}",
+                action.algorithm, action.hash, action.size
+            );
+            let body = serde_json::to_vec(&ActionResult {
+                action,
+                metadata: None,
+                output_root: None,
+                version: 1,
+            })
+            .unwrap();
+            let response = app
+                .clone()
+                .oneshot(request("PUT", uri, Body::from(body)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(body["error"], error);
+        }
     }
 
     #[tokio::test]
@@ -3042,6 +3551,187 @@ mod tests {
                 .unwrap()
                 .status(),
             StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn answers_an_exhausted_database_pool_as_unavailable() {
+        for error in [
+            ApiError::internal(anyhow::Error::from(sqlx::Error::PoolTimedOut)),
+            ApiError::internal(sqlx::Error::PoolTimedOut),
+        ] {
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        }
+        let response =
+            ApiError::internal(anyhow::Error::from(sqlx::Error::RowNotFound)).into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!response.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    /// Metadata whose access writes are recorded, or never complete.
+    #[derive(Default)]
+    struct TouchProbe {
+        inner: MemoryMetadata,
+        stall: bool,
+        entered: tokio::sync::Notify,
+        touches: Mutex<Vec<(String, Vec<Digest>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MetadataStore for TouchProbe {
+        async fn visible_blobs(
+            &self,
+            namespace: &str,
+            digests: &[Digest],
+        ) -> anyhow::Result<Vec<Digest>> {
+            self.inner.visible_blobs(namespace, digests).await
+        }
+        async fn register_blob(
+            &self,
+            namespace: &str,
+            digest: &Digest,
+            stored: PutOutcome,
+        ) -> anyhow::Result<()> {
+            self.inner.register_blob(namespace, digest, stored).await
+        }
+        async fn forget_blob(&self, namespace: &str, digest: &Digest) -> anyhow::Result<()> {
+            self.inner.forget_blob(namespace, digest).await
+        }
+        async fn touch_blobs(&self, namespace: &str, digests: &[Digest]) -> anyhow::Result<()> {
+            self.entered.notify_one();
+            if self.stall {
+                std::future::pending::<()>().await;
+            }
+            let mut digests = digests.to_vec();
+            digests.sort_by(|left, right| left.hash.cmp(&right.hash));
+            self.touches
+                .lock()
+                .unwrap()
+                .push((namespace.to_owned(), digests));
+            Ok(())
+        }
+        async fn get(
+            &self,
+            namespace: &str,
+            action: &Digest,
+        ) -> anyhow::Result<Option<ActionResult>> {
+            self.inner.get(namespace, action).await
+        }
+        async fn commit(
+            &self,
+            namespace: &str,
+            action: &Digest,
+            result: &ActionResult,
+        ) -> anyhow::Result<CommitOutcome> {
+            self.inner.commit(namespace, action, result).await
+        }
+        async fn get_manifest(
+            &self,
+            namespace: &str,
+            key: &Digest,
+        ) -> anyhow::Result<Option<crate::metadata::ManifestRecord>> {
+            self.inner.get_manifest(namespace, key).await
+        }
+        async fn commit_manifest(
+            &self,
+            namespace: &str,
+            key: &Digest,
+            expected_etag: Option<&str>,
+            etag: &str,
+            manifest: &TaskActionManifest,
+        ) -> anyhow::Result<ManifestCommitOutcome> {
+            self.inner
+                .commit_manifest(namespace, key, expected_etag, etag, manifest)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn serves_blobs_while_access_writes_are_stalled() {
+        let directory = tempfile::tempdir().unwrap();
+        let blobs = Arc::new(FilesystemStore::new(directory.path()).await.unwrap());
+        let metadata = Arc::new(TouchProbe {
+            stall: true,
+            ..Default::default()
+        });
+        let auth = Authorizer::new(None, None, true, None).await.unwrap();
+        let state = AppState::new(blobs, metadata.clone(), auth, 1024 * 1024, 8, 0);
+        let app = router(state.clone());
+        let digest = upload_blob(&app, b"hot blob").await;
+        let uri = format!(
+            "/v1/blobs/{}/{}/{}",
+            digest.algorithm, digest.hash, digest.size
+        );
+        let read = || async {
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                app.clone()
+                    .oneshot(request("GET", uri.clone(), Body::empty())),
+            )
+            .await
+            .expect("a blob read waited on its access write")
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        };
+        read().await;
+        let access = state.access.clone();
+        let flushing = tokio::spawn(async move { access.flush().await });
+        tokio::time::timeout(Duration::from_secs(5), metadata.entered.notified())
+            .await
+            .expect("a flush should start writing the access");
+
+        for _ in 0..3 {
+            read().await;
+        }
+        flushing.abort();
+    }
+
+    #[test]
+    fn drops_accesses_past_the_pending_limit() {
+        let access = PendingAccess {
+            metadata: Arc::new(MemoryMetadata::default()),
+            pending: Mutex::default(),
+        };
+        let digests = (0..=MAX_PENDING_ACCESSES)
+            .map(|index| digest(index.to_string().as_bytes()))
+            .collect::<Vec<_>>();
+
+        access.record("three", &[]);
+        access.record("one", &digests);
+        access.record("two", &digests[..1]);
+
+        let pending = access.pending.lock().unwrap();
+        assert_eq!(pending.len, MAX_PENDING_ACCESSES);
+        assert_eq!(pending.namespaces["one"].len(), MAX_PENDING_ACCESSES);
+        assert_eq!(pending.namespaces.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn writes_each_pending_access_once_per_namespace() {
+        let metadata = Arc::new(TouchProbe::default());
+        let access = PendingAccess {
+            metadata: metadata.clone(),
+            pending: Mutex::default(),
+        };
+        let mut both = vec![digest(b"first"), digest(b"second")];
+        both.sort_by(|left, right| left.hash.cmp(&right.hash));
+
+        access.record("one", &both[..1]);
+        access.record("one", &both);
+        access.record("two", &both[1..]);
+        access.flush().await;
+        access.flush().await;
+
+        let mut touches = metadata.touches.lock().unwrap().clone();
+        touches.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            touches,
+            vec![
+                ("one".to_owned(), both.clone()),
+                ("two".to_owned(), both[1..].to_vec())
+            ]
         );
     }
 }

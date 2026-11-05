@@ -16,14 +16,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
         with:
-          version: 2026.10.9
+          version: 2026.10.24
           install: false
           cache: false
       - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
         with:
-          terraform_version: v1.16.5
+          terraform_version: v1.17.0
       - run: terraform -chdir=deploy/azure/terraform fmt -check -recursive
       - run: terraform -chdir=deploy/azure/terraform init -backend=false
       - run: terraform -chdir=deploy/azure/terraform validate
@@ -74,11 +74,23 @@ jobs:
           check custom custom --set serviceAccount.name=custom
           check none existing --set serviceAccount.create=false --set serviceAccount.name=existing
           check none default --set serviceAccount.create=false
+          ext=$(helm template ext charts/mbx-cache \
+            --set config.s3Bucket=cache \
+            --set config.databaseUrlSecretRef.name=db \
+            --set config.databaseUrlSecretRef.key=uri \
+            --set image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000)
+          grep -q 'secretKeyRef: {name: "db", key: "uri"}' <<<"$ext"
+          grep -q 'image: "ghcr.io/jdx/mbx-cache@sha256:0' <<<"$ext"
+          grep -q 'runAsUser: 65532' <<<"$ext"
           helm template azure charts/mbx-cache \
             --set config.storage=azure \
             --set config.databaseUrl=postgres://cache/cache \
             --set config.azureAccount=mbxcache \
             --set config.azureContainer=cache >/dev/null
+          helm template gcs charts/mbx-cache \
+            --set config.storage=gcs \
+            --set config.databaseUrl=postgres://cache/cache \
+            --set config.gcsBucket=cache | grep -q 'name: MBX_CACHE_GCS_BUCKET, value: "cache"'
       - run: shellcheck deploy/azure/deploy.sh deploy/azure/test-deploy.sh
       - run: deploy/azure/test-deploy.sh
   hk:
@@ -88,9 +100,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
         with:
-          version: 2026.10.9
+          version: 2026.10.24
           cache: false
       - run: mise x hk -- hk check --all
         env:
@@ -127,7 +139,7 @@ jobs:
       # two components and no other behaviour.
       - name: Install Rust components
         run: rustup component add rustfmt clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Create the Azurite test container
         env:
           AZURE_STORAGE_CONNECTION_STRING: DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;

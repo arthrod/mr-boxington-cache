@@ -28,6 +28,14 @@ pub struct SweepOutcome {
     pub manifests: u64,
 }
 
+/// Connections of a metadata pool, read when metrics are scraped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolStats {
+    pub max: u32,
+    pub open: u32,
+    pub idle: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManifestCommitOutcome {
     Created,
@@ -62,6 +70,13 @@ pub trait MetadataStore: Send + Sync {
         digest: &Digest,
         stored: PutOutcome,
     ) -> anyhow::Result<()>;
+    /// Forget that a namespace holds a blob storage no longer has.
+    ///
+    /// A lifecycle rule or an operator can delete an object while its row
+    /// still says it is there, and a client told a blob exists never uploads
+    /// it again. Dropping the row makes the next missing-blob query report it,
+    /// whatever the retention and sweep ages are.
+    async fn forget_blob(&self, namespace: &str, digest: &Digest) -> anyhow::Result<()>;
     /// Record that these blobs were served to a client.
     ///
     /// `namespace_blobs.last_accessed_at` otherwise only ever holds the time a
@@ -115,17 +130,22 @@ pub trait MetadataStore: Send + Sync {
     async fn sweep(&self, _older_than_days: u32) -> anyhow::Result<SweepOutcome> {
         Ok(SweepOutcome::default())
     }
+    /// Stores without a connection pool have nothing to report.
+    fn pool_stats(&self) -> Option<PoolStats> {
+        None
+    }
 }
 
 pub async fn from_url(
     url: &str,
     max_connections: u32,
+    acquire_timeout: std::time::Duration,
 ) -> anyhow::Result<std::sync::Arc<dyn MetadataStore>> {
     if url == "memory://" {
         Ok(std::sync::Arc::new(MemoryMetadata::default()))
     } else {
         Ok(std::sync::Arc::new(
-            PostgresMetadata::connect(url, max_connections).await?,
+            PostgresMetadata::connect(url, max_connections, acquire_timeout).await?,
         ))
     }
 }

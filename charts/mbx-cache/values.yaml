@@ -2,28 +2,44 @@ replicaCount: 2
 image:
   repository: ghcr.io/jdx/mbx-cache
   tag: latest
+  # Pins the image by digest (sha256:...); takes precedence over tag.
+  digest: ""
   pullPolicy: IfNotPresent
 service:
   port: 8080
+  annotations: {}
 resources:
   requests: {cpu: 100m, memory: 128Mi}
   limits: {memory: 512Mi}
 config:
   storage: s3
   databaseUrl: ""
+  # Reads the URL from a Secret ({name, key}) instead of databaseUrl.
+  databaseUrlSecretRef: {}
   databaseMaxConnections: 32
+  # Seconds a request waits for a free database connection.
+  databaseAcquireTimeout: 30
   azureAccount: ""
   azureContainer: ""
   azurePrefix: v1
   azureCredentialType: auto
   azureEndpoint: ""
   azureAllowHttp: false
+  gcsBucket: ""
+  gcsPrefix: v1
   s3Bucket: ""
   s3Prefix: v1
   s3Region: us-east-1
   s3Endpoint: ""
   s3PathStyle: false
   maxBlobBytes: "5368709120"
+  # Bytes uploads may spool in /tmp at once (0 = unbounded); at least
+  # maxBlobBytes. The /tmp emptyDir is capped 1 GiB above it.
+  maxSpoolBytes: "10737418240"
+# Serve HTTPS from a kubernetes.io/tls Secret (keys tls.crt, tls.key), such as
+# one issued by cert-manager. The cert is read at startup: restart on rotation.
+tls:
+  secretName: ""
 secret:
   existingSecret: mbx-cache
   tokensKey: tokens-json
@@ -31,8 +47,28 @@ secret:
 serviceAccount:
   create: true
   name: ""
+  annotations: {}
 podAnnotations: {}
+# distroless `nonroot` is uid 65532; the kubelet cannot check a non-numeric
+# image USER against runAsNonRoot, so the ids are set explicitly.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  seccompProfile: {type: RuntimeDefault}
+extraEnv: []
+envFrom: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
 serviceMonitor:
   enabled: false
+  # Endpoint tlsConfig when tls.secretName is set. Prometheus scrapes the pod
+  # IP, so a DNS-only cert needs serverName, plus a ca for a private CA (omit
+  # it for a publicly trusted cert), for example:
+  # tlsConfig:
+  #   serverName: mbx-cache.cache.svc
+  #   ca: {secret: {name: mbx-ca, key: ca.crt}}
+  tlsConfig: {}
 networkPolicy:
   enabled: true

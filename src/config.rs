@@ -6,6 +6,7 @@ use std::path::PathBuf;
 pub enum StorageKind {
     Azure,
     Filesystem,
+    Gcs,
     S3,
 }
 
@@ -14,6 +15,15 @@ pub enum StorageKind {
 pub struct Config {
     #[arg(long, env = "MBX_CACHE_LISTEN", default_value = "0.0.0.0:8080")]
     pub listen: SocketAddr,
+
+    /// Path to a PEM certificate chain file. With `--tls-key`, serve HTTPS
+    /// instead of HTTP.
+    #[arg(long, env = "MBX_CACHE_TLS_CERT", requires = "tls_key")]
+    pub tls_cert: Option<PathBuf>,
+
+    /// Path to the PEM private key file for `--tls-cert`.
+    #[arg(long, env = "MBX_CACHE_TLS_KEY", requires = "tls_cert")]
+    pub tls_key: Option<PathBuf>,
 
     #[arg(
         long,
@@ -37,6 +47,16 @@ pub struct Config {
         value_parser = clap::value_parser!(u32).range(1..)
     )]
     pub database_max_connections: u32,
+
+    /// Seconds a metadata request waits for a free PostgreSQL connection
+    /// before it fails. It also bounds the first connection at startup.
+    #[arg(
+        long,
+        env = "MBX_CACHE_DATABASE_ACQUIRE_TIMEOUT",
+        default_value_t = 30,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub database_acquire_timeout: u64,
 
     /// Sweep metadata older than this many days, then exit without serving.
     ///
@@ -67,6 +87,12 @@ pub struct Config {
 
     #[arg(long, env = "MBX_CACHE_AZURE_ALLOW_HTTP", default_value_t = false)]
     pub azure_allow_http: bool,
+
+    #[arg(long, env = "MBX_CACHE_GCS_BUCKET")]
+    pub gcs_bucket: Option<String>,
+
+    #[arg(long, env = "MBX_CACHE_GCS_PREFIX", default_value = "v1")]
+    pub gcs_prefix: String,
 
     #[arg(long, env = "MBX_CACHE_S3_BUCKET")]
     pub s3_bucket: Option<String>,
@@ -104,6 +130,22 @@ pub struct Config {
 
     #[arg(long, env = "MBX_CACHE_MAX_BLOB_BYTES", default_value_t = 5 * 1024 * 1024 * 1024_u64)]
     pub max_blob_bytes: u64,
+
+    /// Blobs of one uploaded pack stored at the same time. Each store is a
+    /// round trip to object storage, so storing them in turn leaves a large
+    /// pack waiting on latency rather than bandwidth.
+    #[arg(
+        long,
+        env = "MBX_CACHE_PACK_STORE_CONCURRENCY",
+        default_value_t = 8,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub pack_store_concurrency: u32,
+
+    /// Bytes all uploads may hold spooled in the temp directory at once; 0
+    /// leaves it unbounded. An upload past it gets 503 and Retry-After.
+    #[arg(long, env = "MBX_CACHE_MAX_SPOOL_BYTES", default_value_t = 0)]
+    pub max_spool_bytes: u64,
 }
 
 #[cfg(test)]
@@ -113,5 +155,21 @@ mod tests {
     #[test]
     fn rejects_an_empty_database_pool() {
         assert!(Config::try_parse_from(["mbx-cache", "--database-max-connections", "0"]).is_err());
+    }
+
+    #[test]
+    fn rejects_a_zero_database_acquire_timeout() {
+        assert!(Config::try_parse_from(["mbx-cache", "--database-acquire-timeout", "0"]).is_err());
+    }
+
+    #[test]
+    fn rejects_a_tls_cert_without_a_key() {
+        assert!(Config::try_parse_from(["mbx-cache", "--tls-cert", "cert.pem"]).is_err());
+        assert!(Config::try_parse_from(["mbx-cache", "--tls-key", "key.pem"]).is_err());
+    }
+
+    #[test]
+    fn rejects_a_zero_pack_store_concurrency() {
+        assert!(Config::try_parse_from(["mbx-cache", "--pack-store-concurrency", "0"]).is_err());
     }
 }

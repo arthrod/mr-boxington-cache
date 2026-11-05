@@ -55,7 +55,7 @@ mbx-cache \
   --listen 127.0.0.1:8080
 ```
 
-Anonymous access is intended only for a trusted local network. Production installations should terminate TLS at an ingress or proxy and configure tokens.
+Anonymous access is intended only for a trusted local network. Production installations should configure tokens and serve TLS, either at an ingress or proxy or with `--tls-cert` and `--tls-key`.
 
 ## Connect a client
 
@@ -84,16 +84,21 @@ Every option has a matching environment variable and CLI flag. Run `mbx-cache --
 | Environment variable | Default | Purpose |
 |---|---:|---|
 | `MBX_CACHE_LISTEN` | `0.0.0.0:8080` | Listen address |
-| `MBX_CACHE_STORAGE` | `filesystem` | `filesystem`, `s3`, or `azure` |
+| `MBX_CACHE_TLS_CERT` | unset | Path to a PEM certificate chain file, such as `/etc/mbx-cache/tls/tls.crt`; with `MBX_CACHE_TLS_KEY`, serve HTTPS |
+| `MBX_CACHE_TLS_KEY` | unset | Path to the PEM private key file for `MBX_CACHE_TLS_CERT`, such as `/etc/mbx-cache/tls/tls.key` |
+| `MBX_CACHE_STORAGE` | `filesystem` | `filesystem`, `s3`, `azure`, or `gcs` |
 | `MBX_CACHE_DATA_DIR` | `/var/lib/mbx-cache` | Filesystem blob root |
 | `MBX_CACHE_DATABASE_URL` | `memory://` | PostgreSQL URL or development memory store |
 | `MBX_CACHE_DATABASE_MAX_CONNECTIONS` | `32` | Maximum concurrent PostgreSQL metadata connections |
+| `MBX_CACHE_DATABASE_ACQUIRE_TIMEOUT` | `30` | Seconds a request waits for a free PostgreSQL connection before it fails |
 | `MBX_CACHE_AZURE_ACCOUNT` | — | Required Azure Storage account name |
 | `MBX_CACHE_AZURE_CONTAINER` | — | Required Azure Blob container name |
 | `MBX_CACHE_AZURE_PREFIX` | `v1` | Azure object-key prefix |
 | `MBX_CACHE_AZURE_CREDENTIAL_TYPE` | `auto` | Azure credential discovery mode; use `managed_identity` on Azure VMs |
 | `MBX_CACHE_AZURE_ENDPOINT` | Azure default | Override for compatible emulators |
 | `MBX_CACHE_AZURE_ALLOW_HTTP` | `false` | Allow an HTTP emulator endpoint |
+| `MBX_CACHE_GCS_BUCKET` | — | Required Google Cloud Storage bucket name |
+| `MBX_CACHE_GCS_PREFIX` | `v1` | GCS object-key prefix |
 | `MBX_CACHE_S3_BUCKET` | — | Required for S3 storage |
 | `MBX_CACHE_S3_PREFIX` | `v1` | Object-key prefix |
 | `MBX_CACHE_S3_ENDPOINT` | AWS default | S3-compatible endpoint |
@@ -104,10 +109,19 @@ Every option has a matching environment variable and CLI flag. Run `mbx-cache --
 | `MBX_CACHE_ALLOW_ANONYMOUS` | `false` | Allow access without configured grants |
 | `MBX_CACHE_ANONYMOUS_READ_NAMESPACES_JSON` | — | Namespace patterns that may be read without authentication; anonymous writes are always denied |
 | `MBX_CACHE_MAX_BLOB_BYTES` | `5368709120` | Maximum upload size |
+| `MBX_CACHE_PACK_STORE_CONCURRENCY` | `8` | Blobs of one uploaded pack stored at the same time |
+| `MBX_CACHE_MAX_SPOOL_BYTES` | `0` | Bytes all uploads may spool in the temp directory at once (`0` = unbounded); at least `MBX_CACHE_MAX_BLOB_BYTES`. Past it, uploads get `503` with `Retry-After` |
 
 AWS credentials use the standard AWS SDK credential chain, including environment variables, workload identity, ECS, and EC2 roles.
 Azure credentials are discovered by the object-store client. The production
 deployment uses the VM's managed identity and stores no account key.
+GCS credentials are discovered by the object-store client too:
+`GOOGLE_SERVICE_ACCOUNT` points to a service-account file and
+`GOOGLE_SERVICE_ACCOUNT_KEY` holds its serialized JSON. Without either, the
+client uses Application Default Credentials (`GOOGLE_APPLICATION_CREDENTIALS`),
+then the metadata server, which serves GKE Workload Identity, so no key is needed.
+A GCS request has no overall timeout below 1 hour and fails after 30 seconds
+without data; set `GOOGLE_TIMEOUT` or `GOOGLE_READ_TIMEOUT` to change them.
 
 ### Authorization
 
@@ -234,7 +248,10 @@ Treat the output as a secret even though it is short-lived. Set the audience in 
 ## Deployment
 
 - `docker-compose.yml` runs a local development stack with PostgreSQL and MinIO.
-- `charts/mbx-cache` runs a horizontally scalable Kubernetes deployment.
+- `charts/mbx-cache` runs a horizontally scalable Kubernetes deployment. It can
+  read the database URL from a Secret (`config.databaseUrlSecretRef`), pin the
+  image by digest, and take `extraEnv`, `envFrom`, ServiceAccount and Service
+  annotations (for example GKE Workload Identity or NEGs), and scheduling values.
 - [`deploy/coolify`](deploy/coolify/README.md) runs a single-node, internal-only
   cache on Coolify for runners on the same Docker host.
 - [`deploy/azure`](deploy/azure/README.md) provisions a low-cost US production
@@ -273,8 +290,9 @@ Servers advertising `features.action_batch` answer `POST /v1/action-results:batc
 ### Bounding storage
 
 Blob storage is expired by the object store's lifecycle policy (an S3 bucket
-lifecycle rule or an Azure Blob lifecycle management rule); `mbx-cache` removes
-the metadata those objects leave behind and exits without serving:
+lifecycle rule, an Azure Blob lifecycle management rule, or a GCS Object
+Lifecycle Management rule); `mbx-cache` removes the metadata those objects
+leave behind and exits without serving:
 
 ```sh
 mbx-cache --sweep-metadata-older-than-days 35
@@ -284,7 +302,9 @@ It drops blob rows past that age, the action results left referencing them, and
 manifests untouched for that long. Keep the age longer than the storage
 lifecycle so objects go first — reversed, it removes rows for objects that still
 exist and turns cache hits into recompiles. A dangling reference is never fatal:
-a client that cannot fetch a blob treats the action as a miss.
+a client that cannot fetch a blob treats the action as a miss. A read that
+finds a listed blob gone from storage drops that namespace's row for it, so the
+next missing-blob query reports it and the client uploads it again.
 
 Run multiple stateless replicas against the same PostgreSQL database and object
 store. Readiness and liveness probes use `/v1/status`. Scrape `/metrics` with
